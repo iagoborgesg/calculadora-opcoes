@@ -1,12 +1,14 @@
-
 import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from scipy.stats import norm
-import yfinance as yf
 import warnings
 warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────
+# MODELOS
+# ─────────────────────────────────────────────
 
 def black_scholes(S, K, T, r, sigma, tipo):
     if T <= 0:
@@ -27,20 +29,17 @@ def vega_bs(S, K, T, r, sigma):
 def monte_carlo(S, K, T, r, sigma, tipo, opcao_tipo, n_sim, n_steps=252):
     np.random.seed(42)
     dt = T / n_steps
-    payoffs = []
-    trajetorias = []
+    payoffs, trajetorias = [], []
     for i in range(n_sim):
         prices = [S]
         for _ in range(n_steps):
             Z = np.random.standard_normal()
-            S_t = prices[-1] * np.exp((r - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * Z)
-            prices.append(S_t)
-        ST = prices[-1]
+            prices.append(prices[-1] * np.exp((r - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*Z))
         S_media = np.mean(prices)
         if opcao_tipo == "asiatica":
             payoff = max(S_media - K, 0) if tipo == "call" else max(K - S_media, 0)
         else:
-            payoff = max(ST - K, 0) if tipo == "call" else max(K - ST, 0)
+            payoff = max(prices[-1] - K, 0) if tipo == "call" else max(K - prices[-1], 0)
         payoffs.append(payoff)
         if i < 50:
             trajetorias.append(prices)
@@ -54,61 +53,61 @@ def arvore_binomial(S, K, T, r, sigma, tipo, opcao_tipo, n_steps):
     d = 1 / u
     p = (np.exp(r * dt) - d) / (u - d)
     disc = np.exp(-r * dt)
-    ST = np.array([S * (u ** j) * (d ** (n_steps - j)) for j in range(n_steps + 1)])
+    ST = np.array([S * (u**j) * (d**(n_steps-j)) for j in range(n_steps+1)])
     V = np.maximum(ST - K, 0) if tipo == "call" else np.maximum(K - ST, 0)
-    for i in range(n_steps - 1, -1, -1):
-        S_node = np.array([S * (u ** j) * (d ** (i - j)) for j in range(i + 1)])
-        V = disc * (p * V[1:i+2] + (1 - p) * V[0:i+1])
+    for i in range(n_steps-1, -1, -1):
+        S_node = np.array([S * (u**j) * (d**(i-j)) for j in range(i+1)])
+        V = disc * (p * V[1:i+2] + (1-p) * V[0:i+1])
         if opcao_tipo == "americana":
             V = np.maximum(V, S_node - K) if tipo == "call" else np.maximum(V, K - S_node)
     return V[0]
 
-def vol_implicita_bissecao(S, K, T, r, preco_mercado, tipo, tol=1e-6, max_iter=1000):
-    sigma_min, sigma_max = 1e-4, 10.0
-    f_min = black_scholes(S, K, T, r, sigma_min, tipo) - preco_mercado
-    f_max = black_scholes(S, K, T, r, sigma_max, tipo) - preco_mercado
-    if f_min * f_max > 0:
+def vol_implicita_bissecao(S, K, T, r, pm, tipo):
+    smin, smax = 1e-4, 10.0
+    fmin = black_scholes(S, K, T, r, smin, tipo) - pm
+    fmax = black_scholes(S, K, T, r, smax, tipo) - pm
+    if fmin * fmax > 0:
         return None, "Preco de mercado fora dos limites teoricos."
-    for _ in range(max_iter):
-        sigma_mid = (sigma_min + sigma_max) / 2
-        f_mid = black_scholes(S, K, T, r, sigma_mid, tipo) - preco_mercado
-        if abs(f_mid) < tol:
-            return sigma_mid, None
-        if f_min * f_mid < 0:
-            sigma_max = sigma_mid
-            f_max = f_mid
+    for _ in range(1000):
+        smid = (smin + smax) / 2
+        fmid = black_scholes(S, K, T, r, smid, tipo) - pm
+        if abs(fmid) < 1e-6:
+            return smid, None
+        if fmin * fmid < 0:
+            smax, fmax = smid, fmid
         else:
-            sigma_min = sigma_mid
-            f_min = f_mid
-    return (sigma_min + sigma_max) / 2, None
+            smin, fmin = smid, fmid
+    return (smin + smax) / 2, None
 
-def vol_implicita_newton(S, K, T, r, preco_mercado, tipo, tol=1e-6, max_iter=100):
+def vol_implicita_newton(S, K, T, r, pm, tipo):
     sigma = 0.3
-    for _ in range(max_iter):
-        preco = black_scholes(S, K, T, r, sigma, tipo)
+    for _ in range(100):
         v = vega_bs(S, K, T, r, sigma)
         if abs(v) < 1e-10:
             return None, "Vega muito baixo."
-        sigma_novo = sigma - (preco - preco_mercado) / v
+        sigma_novo = sigma - (black_scholes(S, K, T, r, sigma, tipo) - pm) / v
         if sigma_novo <= 0:
             return None, "Sigma negativo."
-        if abs(sigma_novo - sigma) < tol:
+        if abs(sigma_novo - sigma) < 1e-6:
             return sigma_novo, None
         sigma = sigma_novo
     return None, "Nao convergiu."
 
-@st.cache_data(ttl=300)
-def buscar_dados(ticker, periodo="1y"):
+def buscar_dados(ticker):
     try:
-        dados = yf.download(ticker, period=periodo, progress=False, auto_adjust=True)
+        import yfinance as yf
+        dados = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
         if dados.empty:
             return None, None, None
-        preco_atual = float(dados["Close"].iloc[-1])
-        log_ret = np.log(dados["Close"] / dados["Close"].shift(1)).dropna()
-        vol_hist = float(log_ret.std() * np.sqrt(252))
-        return preco_atual, vol_hist, dados
-    except:
+        preco = float(dados["Close"].iloc[-1])
+        vol = float(np.log(dados["Close"] / dados["Close"].shift(1)).dropna().std() * np.sqrt(252))
+        return preco, vol, dados
+    except Exception as e:
         return None, None, None
+
+# ─────────────────────────────────────────────
+# GRAFICOS
+# ─────────────────────────────────────────────
 
 def grafico_payoff(S, K, tipo, preco_opcao):
     S_range = np.linspace(S * 0.5, S * 1.5, 300)
@@ -148,6 +147,10 @@ def grafico_historico(dados, ticker):
     fig.update_layout(title="Historico - " + ticker, xaxis_title="Data", yaxis_title="Preco (R$)", template="plotly_dark", height=350)
     return fig
 
+# ─────────────────────────────────────────────
+# APP
+# ─────────────────────────────────────────────
+
 st.set_page_config(page_title="Calculadora de Opcoes", page_icon="📊", layout="wide")
 st.title("📊 Calculadora de Opcoes")
 st.caption("Black-Scholes · Monte Carlo · Arvore Binomial · Volatilidade Implicita")
@@ -155,8 +158,11 @@ st.divider()
 
 with st.sidebar:
     st.header("Parametros")
+
+    # ── Ativo ──
+    st.subheader("Ativo")
     ticker = st.text_input("Ticker (Yahoo Finance)", value="PETR4.SA")
-    usar_yahoo = st.checkbox("Buscar dados do Yahoo Finance", value=True)
+    usar_yahoo = st.checkbox("Buscar dados do Yahoo Finance", value=False)
 
     preco_atual_yahoo = None
     vol_hist_yahoo = None
@@ -168,24 +174,27 @@ with st.sidebar:
         if preco_atual_yahoo:
             st.success("Preco atual: R$ " + str(round(preco_atual_yahoo, 2)))
             st.info("Vol. Historica: " + str(round(vol_hist_yahoo * 100, 1)) + "% a.a.")
+            st.caption("Use os valores acima nos campos abaixo.")
         else:
-            st.warning("Ticker nao encontrado. Insira os dados manualmente.")
+            st.warning("Ticker nao encontrado. Insira os valores manualmente.")
 
     st.divider()
-    S_default = float(preco_atual_yahoo) if preco_atual_yahoo else 38.0
-    sigma_default = float(vol_hist_yahoo) if vol_hist_yahoo else 0.30
 
-    S = st.number_input("Preco atual do ativo (S0)", value=S_default, min_value=0.01, step=0.5, format="%.2f")
-    K = st.number_input("Preco de exercicio (K)", value=round(S_default * 1.05, 0), min_value=0.01, step=0.5, format="%.2f")
+    # ── Parametros manuais ──
+    st.subheader("Parametros da Opcao")
+    S = st.number_input("Preco atual do ativo (S0)", value=38.0, min_value=0.01, step=0.5, format="%.2f")
+    K = st.number_input("Preco de exercicio (K)", value=40.0, min_value=0.01, step=0.5, format="%.2f")
     T = st.number_input("Prazo ate vencimento (anos)", value=0.5, min_value=0.01, max_value=5.0, step=0.05, format="%.2f")
     r = st.number_input("Taxa livre de risco (a.a.)", value=0.10, min_value=0.0, max_value=1.0, step=0.01, format="%.3f")
-    sigma = st.number_input("Volatilidade (a.a.)", value=sigma_default, min_value=0.01, max_value=5.0, step=0.01, format="%.3f")
+    sigma = st.number_input("Volatilidade (a.a.)", value=0.30, min_value=0.01, max_value=5.0, step=0.01, format="%.3f")
 
     st.divider()
+    st.subheader("Tipo de Opcao")
     tipo_payoff = st.radio("Payoff", ["call", "put"], horizontal=True)
     tipo_opcao = st.radio("Estilo", ["europeia", "americana", "asiatica"], horizontal=True)
 
     st.divider()
+    st.subheader("Metodo de Precificacao")
     metodo = st.radio("Metodo", ["Black-Scholes", "Monte Carlo", "Arvore Binomial", "Todos"], index=3)
 
     n_sim = 10000
@@ -196,6 +205,7 @@ with st.sidebar:
         n_steps = st.slider("Passos (Arvore Binomial)", 10, 500, 100, step=10)
 
     st.divider()
+    st.subheader("Volatilidade Implicita")
     calcular_vi = st.checkbox("Calcular Volatilidade Implicita", value=False)
     preco_mercado_vi = 2.0
     metodo_vi = "Bissecao"
@@ -206,12 +216,26 @@ with st.sidebar:
 
     calcular = st.button("Calcular", type="primary", use_container_width=True)
 
+# ── TELA INICIAL ──
 if not calcular:
     st.info("Configure os parametros na barra lateral e clique em Calcular.")
     c1, c2, c3 = st.columns(3)
-    c1.markdown("**Modelos**\n- Black-Scholes\n- Monte Carlo\n- Arvore Binomial")
-    c2.markdown("**Funcionalidades**\n- Yahoo Finance\n- Vol. historica e implicita\n- Graficos")
-    c3.markdown("**Exemplos**\n- PETR4.SA Call Europeia\n- VALE3.SA Put Americana\n- ITUB4.SA Call Asiatica")
+    with c1:
+        st.markdown("**Modelos**")
+        st.markdown("- Black-Scholes (europeia)")
+        st.markdown("- Monte Carlo (europeia e asiatica)")
+        st.markdown("- Arvore Binomial (europeia e americana)")
+    with c2:
+        st.markdown("**Funcionalidades**")
+        st.markdown("- Volatilidade historica e implicita")
+        st.markdown("- Graficos de payoff e simulacoes")
+        st.markdown("- Gregas completas")
+    with c3:
+        st.markdown("**Exemplos do Case**")
+        st.markdown("- S0=38, K=40, T=0.5, r=10%, sigma=30%")
+        st.markdown("- Call Europeia: R$ 3,1874")
+        st.markdown("- Comparar BS, MC e Binomial")
+
 else:
     resultados = {}
     erro_mc = None
@@ -248,6 +272,7 @@ else:
                 cols[-1].error("VI: " + str(err_vi))
 
         st.divider()
+
         if len(resultados) > 1:
             st.subheader("Comparacao entre Metodos")
             rows = []
@@ -279,7 +304,7 @@ else:
             st.plotly_chart(grafico_smile(S, K, T, r, tipo_payoff), use_container_width=True)
             st.markdown("Smile de volatilidade: vol. implicita tende a ser maior nas pontas (ITM e OTM).")
             if calcular_vi and vi:
-                st.info("Vol. implicita para K=" + str(K) + ": **" + str(round(vi * 100, 2)) + "%** (preco de mercado = R$ " + str(round(preco_mercado_vi, 3)) + ")")
+                st.info("Vol. implicita para K=" + str(K) + ": **" + str(round(vi * 100, 2)) + "%**")
 
         with tab4:
             if dados_hist is not None:
@@ -290,7 +315,7 @@ else:
                 cb.metric("Vol. Historica (a.a.)", str(round(float(ret.std() * np.sqrt(252)) * 100, 1)) + "%")
                 cc.metric("Retorno 1 ano", str(round(float((dados_hist["Close"].iloc[-1] / dados_hist["Close"].iloc[0] - 1)) * 100, 1)) + "%")
             else:
-                st.info("Ative o Yahoo Finance para ver o historico.")
+                st.info("Ative o Yahoo Finance e clique em Calcular para ver o historico.")
 
         st.divider()
         st.subheader("Gregas (Black-Scholes)")
@@ -315,13 +340,13 @@ else:
 
         st.divider()
         with st.expander("Perguntas para Discussao (do Case)"):
-            st.markdown("1. **Por que Black-Scholes e mais adequado para opcoes europeias?** BS assume exercicio apenas no vencimento. Para americanas, e necessario avaliar o exercicio antecipado em cada passo.")
-            st.markdown("2. **Por que opcoes americanas exigem analise de exercicio antecipado?** O detentor pode exercer antes do vencimento. Em cada no da arvore, compara-se V_continuidade com V_exercicio.")
-            st.markdown("3. **Quando Monte Carlo e mais adequado?** Para opcoes exoticas cujo payoff depende de toda a trajetoria do preco, como as asiaticas.")
+            st.markdown("1. **Por que Black-Scholes e mais adequado para opcoes europeias?** BS assume exercicio apenas no vencimento. Para americanas e necessario avaliar o exercicio antecipado em cada passo.")
+            st.markdown("2. **Por que opcoes americanas exigem analise de exercicio antecipado?** O detentor pode exercer antes do vencimento. Em cada no da arvore compara-se V_continuidade com V_exercicio.")
+            st.markdown("3. **Quando Monte Carlo e mais adequado?** Para opcoes exoticas cujo payoff depende de toda a trajetoria do preco como as asiaticas.")
             st.markdown("4. **Por que opcoes asiaticas sao uteis em commodities?** Reduzem o impacto de movimentos extremos em uma unica data.")
             st.markdown("5. **O que significa uma volatilidade implicita elevada?** Maior incerteza precificada pelo mercado.")
             st.markdown("6. **Diferenca entre vol. historica e implicita?** Historica: dados passados. Implicita: extraida do preco da opcao no mercado.")
             st.markdown("7. **Quando Newton-Raphson pode falhar?** Quando o Vega e muito baixo ou o chute inicial esta longe da solucao.")
             st.markdown("8. **Por que a Bissecao e mais robusta?** Sempre converge desde que o intervalo contenha a solucao.")
             st.markdown("9. **Como o aumento da volatilidade afeta calls e puts?** Aumenta o premio de ambas.")
-            st.markdown("10. **Como a calculadora poderia ser usada por uma mesa de trading?** Comparar vol. implicita com historica, montar estrategias de hedge, marcar posicoes a mercado.")
+            st.markdown("10. **Como a calculadora poderia ser usada por uma mesa de trading?** Comparar vol. implicita com historica montar estrategias de hedge e marcar posicoes a mercado.")
